@@ -1,0 +1,12 @@
+services:
+  dns-helper:
+    build: .    
+    image: dns-helper:1.0.0
+    container_name: dns-helper
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/dbus:/var/run/dbus
+    network_mode: host

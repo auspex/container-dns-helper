@@ -2,9 +2,8 @@ import docker
 import os
 import sys
 import threading
-import subprocess
 import signal
-from pyroute2 import IPRoute, IPDB
+from pyroute2 import IPDB
 ipdb = IPDB()
 default_route = ipdb.interfaces[ipdb.routes['default']['oif']]['ifname']
 client = docker.DockerClient(base_url='unix://var/run/docker.sock')
