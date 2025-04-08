@@ -15,7 +15,7 @@ def signal_handler(sig, frame):
 
 def init():
     global default_route
-    containers = set(container.name for container in docker.containers.list(filters={'label':'traefik.enable=true'})).intersection(container.name for network in docker.networks.list(filters={'driver':'bridge'}, greedy=True) for container in network.containers)
+    containers = set(container.name for container in docker.containers.list(filters={'label':'dhcp=true'})).intersection(container.name for network in docker.networks.list(filters={'driver':'bridge'}, greedy=True) for container in network.containers)
     delete_interfaces(containers)
     routes = ipr.get_default_routes()
     if len(routes) > 0:

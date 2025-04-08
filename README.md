@@ -7,17 +7,17 @@ A simple NetworkManager helper to insert all of your Docker container names into
 I want to be able to find any container on my host machine by name just as I would find the host itself. 
 
 There are a number of methods available to create mDNS names for your docker containers. These would be aliases for the host machine. `hardillb/traefik-avahi-helper` was the best I found, 
-but in my experience mDNS was less than robust. 
+but in my experience mDNS was less than robust (that's no slur on the the above software, but problems with mDNS). 
 Sometimes the names wouldn't be published. At others, I could see the names from my local server but not from any other machine on the LAN. It's probably my misconfiguration, but I found it 
 frustrating, and figured there had to be an easy way to get my local router to add an 'alias'. But, it's **not** simple. If you tell DHCP to assign an IP for a new host name, it'll match on 
 the interface's MAC address, and just rename your machine, rather than creating a new one.
 
-This approach uses NetworkManager's `nmcli` to create a new `macvlan` interface as a child of your primary Internet-facing ethernet NIC. A `macvlan` interface has a new MAC address, 
+This approach uses NetworkManager's `nmcli` to create a new `macvlan` interface as a child of your primary Internet-facing ethernet NIC, for any container with a `label` of `dhcp=true`. A `macvlan` interface has a new MAC address, 
 different from anything existing on your host. Therefore, when NetworkManager brings it up, it will get assigned a new IP—even though traffic will actually flow through the parent interface.
 
 So, if my host machine is named **server.home** and has an IP address of 192.168.1.10, a container named **mycontainer** might be given the name **mycontainer.home** and assigned 192.168.1.15.
 The Avahi/mDNS method would have made them **server.local** and **mycontainer.local** and both names would translate to 192.168.1.10, but the important detail is that in either case, everything is 
-sent to 192.168.1.10 and standard reverse proxies can route to the correct container.
+sent to the physical interface that has the IP 192.168.1.10 and standard reverse proxies can route to the correct container.
 
 ## Getting Started
 
@@ -36,9 +36,11 @@ In order to run this container you'll need docker installed.
 
 To be honest, I see no likelihood of this ever working on Windows, and not much chance of OS X :-)
 
-You also need to be running a version of Linux that uses NetworkManager.
+Your host machine also need to be running a version of Linux that uses NetworkManager.
 
 ### Usage
+
+Add the label `dhcp=true` to any container that you wish to put into your local DNS.
 
 From the directory of your git clone:
 
@@ -48,7 +50,8 @@ docker compose up -d --build
 
 #### Container Parameters
 
-The compose file runs with `security_opt` `apparmor:unconfined` to permit communication with DBUS.
+The compose file runs with `security_opt=apparmor:unconfined` to permit communication with DBUS.
+Also, if the host interface is delete for any reason other than being stopped by NetworkManager, `nmcli` is unable to cleanup the macvlan interfaces. Consequently we need `cap_add=['NET_ADMIN','NET_RAW']` to allow the container to delete the macvlan interfaces if necessary. 
 
 #### Environment Variables
 None yet
