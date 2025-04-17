@@ -1,78 +1,136 @@
-from docker import DockerClient
 import os
+import signal
 import sys
 import threading
-import signal
-from pyroute2 import IPRoute
-from pyroute2.netlink.exceptions import NetlinkError
-from NetworkManager import *
-from sdbus_block.networkmanager.enums import DeviceType
+import asyncio
 
+import sdbus
+from docker import DockerClient
+from pyroute2 import IPRoute
+from sdbus_async.networkmanager import (
+    NetworkConnectionSettings,
+    NetworkManager,
+    NetworkManagerSettings,
+    )
+from sdbus_async.networkmanager.settings import (
+    ConnectionProfile,
+    ConnectionSettings,
+    Ipv4Settings, 
+    MacvlanSettings,
+    )
+
+sdbus.set_default_bus(sdbus.sd_bus_open_system())
 
 ipr = IPRoute()
-default_route = ''
 docker = DockerClient(base_url='unix://var/run/docker.sock')
+NM = NetworkManager()
+class ShutdownRequested(BaseException): pass
 
 def signal_handler(sig, frame):
     if sig in [signal.SIGKILL, signal.SIGINT]:
-        shutdown()
+        raise ShutdownRequested
 
-def init():
-    global default_route
-    containers = set(container.name for container in docker.containers.list(filters={'label':'dhcp=true'})).intersection(container.name for network in docker.networks.list(filters={'driver':'bridge'}, greedy=True) for container in network.containers)
+def container_names():
+    ### get names of all Docker containers having the label `dhcp=true` and using a `bridge`
+    return set(
+        container.name for container in docker.containers.list(filters={'label':'dhcp=true'})
+    ).intersection(
+        container.name for network in docker.networks.list(filters={'driver':'bridge'}, greedy=True) for container in network.containers
+    )
+
+def default_route():
+    # ASSUME that get_default_routes actually returns routes in metric order
+    # -- I'm not sure that's guaranteed!
     routes = ipr.get_default_routes()
+    ifname = None
     if len(routes) > 0:
-        # ASSUME that get_default_routes actually returns routes in metric order -- I'm not sure that's guaranteed!
         link = ipr.get_links(routes[0].get('OIF'))
-        default_route = link[0].get('ifname')
-        [publish_IP(default_route, container) for container in containers]
+        ifname = link[0].get('ifname')
+    return ifname
 
-def delete_interfaces(containers):
-    print ('deleting interfaces')
-    connections = ' '.join(containers)
-    os.system(f'nmcli connection delete {connections}')
+async def init():
+    containers = container_names()
+    parent = default_route()
+    if parent is not None:
+        [await publish_IP(parent, container) for container in containers]
 
-def shutdown():
-    containers = set(container.name for container in docker.containers.list(filters={'label':'traefik.enable=true'})).intersection(container.name for network in docker.networks.list(filters={'driver':'bridge'}, greedy=True) for container in network.containers)
-    delete_interfaces(containers)
+    try:
+        for event in docker.events(filters={'type':'network'}, decode=True):
+            if ShutdownRequested: 
+                break
+            attributes = event['Actor']['Attributes']
+            if attributes['type'] == 'bridge':
+                container = docker.containers.get(attributes['container'])
+                if container.labels['dhcp'] == 'true':
+                    if event['Action'] == 'connect':
+                        await publish_IP(default_route(), container.name)
+                    else:
+                        await unpublish_IP(container.name)
+    except ShutdownRequested:
+        print ('shutting down')
+
+    [await unpublish_IP(container) for container in container_names()]
     ipr.release()
-    print ('shutting down')
-    sys.exit(0)
     
-def network_changed(env, msg):
-    index = msg['index']
-    action = msg['event']
-    interface = msg.get('ifname')
-    if action == 'RTM_DELLINK' or action == 'RTM_DELROUTE':
-        print(interface)
-    if action == 'RTM_DELLINK' and interface == default_route:
-        init()
+async def publish_IP(default_route, container):
+    """
+    Create a Macvlan connection named `container`, with `default_route` as the parent, 
+    and get an IPv4 address via DHCP
 
-def publish_IP(default_route, container):
-    cmd = f'nmcli connection add ifname {container} con-name {container} save no type macvlan dev {default_route} mode vepa -- +ipv4.dhcp-hostname {container}'
-    print (cmd)
-    ret_code = os.system(cmd)
+    Functionally equivalent to:
+        nmcli connection add ifname {container} con-name {container} save no type macvlan dev {default_route} mode vepa -- +ipv4.dhcp-hostname {container}
+    """
+    print(f'nmcli connection add ifname {container} con-name {container} save no type macvlan dev {default_route} mode vepa -- +ipv4.dhcp-hostname {container}')
+    connection_paths = await NetworkManagerSettings().get_connections_by_id(container)
+    if len(connection_paths) == 0:
+        # create a new Macvlan device
+        # # make the new connection Macvlan, with autoconnect
+        profile = ConnectionProfile(
+            connection=ConnectionSettings(
+                autoconnect=True,
+                connection_id=container,
+                connection_type='macvlan',
+                interface_name=container
+            ),
+            macvlan=MacvlanSettings(
+                parent=default_route,
+                mode=1 # vepa
+            ),
+            # # don't forget to tell NetworkManager to request an IP for this hostname
+            ipv4=Ipv4Settings(
+                dhcp_hostname=container,
+                method='auto',
+                )
+        )
+        path = await NetworkManagerSettings().add_connection_unsaved(profile.to_dbus())
+        # Now, NetworkManager should have a profile, but you still have to activate it
+        await NM.activate_connection(path)
+    else:
+        # modify existing device
+        # (need to find the .../Settings object from the .../ActiveConnection object)
+        connection = NetworkConnectionSettings(connection_paths[0])
 
-def unpublish_IP(container):
-    os.system(f'nmcli connection delete {container}')
+        settings = await connection.get_settings()
+        settings['connection']['id'] = container
+        settings['connection']['interface-name'] = container
+        settings['connection']['autoconnect'] = True
+        settings['macvlan']['parent'] = default_route
+        settings['ipv4']['dhcp-hostname'] = container
+        settings.update()
+        # might need to deactivate before re-activating
+        await NM.activate_connection(connection_paths[0])
 
-def docker_event_thread(name):
-    for event in docker.events(filters={'type':'network'}, decode=True):
-        attributes = event['Actor']['Attributes']
-        if attributes['type'] == 'bridge':
-            container = docker.containers.get(attributes['container'])
-            if event['Action'] == 'connect':
-                publish_IP(default_route, container.name)
-            else:
-                unpublish_IP(container.name)
+async def unpublish_IP(container):
+    print(f'nmcli connection delete {container}')
+    connection_paths = await NetworkManagerSettings().get_connections_by_id(container)
+    if len(connection_paths) > 0:
+        connection = NetworkConnectionSettings(connection_paths[0])
+        await connection.delete()
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    init()
+    asyncio.run(init())
+    # init()
     
-    ipr.register_callback(network_changed)
-
-    thread = threading.Thread(target=docker_event_thread, args=(1,))
-    thread.start()
-    thread.join()
+    # ipr.register_callback(network_changed)
