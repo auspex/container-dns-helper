@@ -5,6 +5,10 @@ import threading
 import signal
 from pyroute2 import IPRoute
 from pyroute2.netlink.exceptions import NetlinkError
+from NetworkManager import *
+from sdbus_block.networkmanager.enums import DeviceType
+
+
 ipr = IPRoute()
 default_route = ''
 docker = DockerClient(base_url='unix://var/run/docker.sock')
@@ -16,32 +20,17 @@ def signal_handler(sig, frame):
 def init():
     global default_route
     containers = set(container.name for container in docker.containers.list(filters={'label':'dhcp=true'})).intersection(container.name for network in docker.networks.list(filters={'driver':'bridge'}, greedy=True) for container in network.containers)
-    delete_interfaces(containers)
     routes = ipr.get_default_routes()
     if len(routes) > 0:
+        # ASSUME that get_default_routes actually returns routes in metric order -- I'm not sure that's guaranteed!
         link = ipr.get_links(routes[0].get('OIF'))
         default_route = link[0].get('ifname')
         [publish_IP(default_route, container) for container in containers]
 
 def delete_interfaces(containers):
     print ('deleting interfaces')
-    # os.system(f'ip link delete group containers')
     connections = ' '.join(containers)
     os.system(f'nmcli connection delete {connections}')
-    # in case the host interface is already down, nmcli deletes the Network Manager connection, but 
-    # not the IpRoute interface
-    for msg in ipr.get_links(*ipr.link_lookup(kind='macvlan')):
-        ifname = msg.get('ifname').split('@')[0]
-        # if there are NO macvlan, then ALL interfaces are returned
-        if ifname == 'lo':
-            break
-        index = msg['index']
-        print(f'- ({index}) {ifname}')
-        if ifname in containers:
-            try:
-                ipr.link("delete", index=index)
-            except NetlinkError as e:
-                print (repr(e))
 
 def shutdown():
     containers = set(container.name for container in docker.containers.list(filters={'label':'traefik.enable=true'})).intersection(container.name for network in docker.networks.list(filters={'driver':'bridge'}, greedy=True) for container in network.containers)
