@@ -1,13 +1,8 @@
 services:
   dns-helper:
     image: ghcr.io/auspex/container-dns-helper:latest
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
     container_name: dns-helper
     restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/run/dbus:/var/run/dbus
