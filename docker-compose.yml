@@ -1,15 +1,17 @@
 services:
   dns-helper:
     image: ghcr.io/auspex/container-dns-helper:latest
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
+    # needed to prevent python's output being buffered (so you can watch the container log)
+    tty: true
     container_name: dns-helper
     restart: unless-stopped
+    # needed to let the container issue NetworkManager commands via DBUS
     security_opt:
       - apparmor:unconfined
     volumes:
+      # to watch for network connection/disconnection
       - /var/run/docker.sock:/var/run/docker.sock
+      # to issue commands to NetworkManager
       - /var/run/dbus:/var/run/dbus
     network_mode: host
  

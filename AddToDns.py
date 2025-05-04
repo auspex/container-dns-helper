@@ -3,9 +3,11 @@
 import signal
 import asyncio
 
+from aiodocker.docker import Docker
+from aiodocker.exceptions import DockerError
+
 import sdbus
-from docker import DockerClient
-from pyroute2 import IPRoute, NDB
+from pyroute2 import IPRoute
 from sdbus_async.networkmanager import (
     NetworkConnectionSettings,
     NetworkManager,
@@ -18,36 +20,34 @@ from sdbus_async.networkmanager.settings import (
     Ipv4Settings, 
     MacvlanSettings,
     )
-from sdbus.utils import parse
-
-from pyroute2.netlink.rtnl.ifinfmsg import ifinfmsg
+from sdbus_async.networkmanager.enums import DeviceState, DeviceStateReason
 
 sdbus.set_default_bus(sdbus.sd_bus_open_system())
-
 ipr = IPRoute()
-docker = DockerClient(base_url='unix://var/run/docker.sock')
-NM = NetworkManager()
-
-class ShutdownRequested(BaseException): pass
+nm = NetworkManager()
 
 def signal_handler(sig, frame):
     """
     Exit cleanly on SIGTERM ("docker stop"), SIGINT (^C when interactive)
     """
+    global group
     if sig in [signal.SIGINT, signal.SIGTERM]:
-        raise ShutdownRequested
+        group.cancel()
 
-def container_names():
+async def container_names(docker: Docker) -> list:
     """
     Get names of all Docker containers having the label `dhcp=true` and using a `bridge` network interface
     """
-    return set(
-        container.name for container in docker.containers.list(filters={'label':'dhcp=true'})
-    ).intersection(
-        container.name for network in docker.networks.list(filters={'driver':'bridge'}, greedy=True) for container in network.containers
-    )
+    network_names = [network['Name'] for network in (await docker.networks.list(filters={'driver':['bridge']}))]
+    containers = await docker.containers.list(filters={
+        'label': ['dhcp=true'],
+        'status': ['running'],
+        'network': network_names,
+        })
+    names = [(await container.show())["Name"].replace('/','') for container in containers]
+    return names
 
-def get_default_route():
+def get_default_route() -> str:
     # ASSUME that get_default_routes actually returns routes in metric order
     # -- I'm not sure that's guaranteed!
     routes = ipr.get_default_routes()
@@ -57,63 +57,64 @@ def get_default_route():
         ifname = link[0].get('ifname')
     return ifname
 
-async def watch_for_disconnect(iface):
+async def watch_for_disconnect(parent: str) -> None:
     """
-    Watch for disconnection on the default route. If it disconnects, signal RouteChanged to rebuild the macvlans
-
-    NB. This isn't working!
+    Watch for disconnection on the default route. If it disconnects, exit and let Docker restart the container
     """
-    devices = [NetworkDeviceGeneric(x) for x in (await NM.get_devices())]
-    paths = [await x.active_connection for x in devices if await x.interface==iface]
+    global group
 
-    # settings = NetworkManagerSettings()
-    # async for x in settings.connection_removed:
-    #     print(x)
-
-    connection = NetworkConnectionSettings(paths[0])
     try:
-        async for x in connection.removed:
-            print (x)
-            # If the default route changes, just shut down the container, and let Docker restart it
-            raise ShutdownRequested
+        device_path = await nm.get_device_by_ip_iface(parent)
+        generic_device = NetworkDeviceGeneric(device_path)
+        async for (
+            new_state,
+            old_state,
+            reason,
+        ) in generic_device.state_changed.catch():
+            print(
+                f"Now {DeviceState(new_state).name}, "
+                f"was {DeviceState(old_state).name}, "
+                f"reason {DeviceStateReason(reason).name}"
+            )
+            if DeviceState(new_state) == DeviceState.DISCONNECTED:
+                group.cancel()
     except asyncio.exceptions.CancelledError:
         pass
 
-async def init():
+async def publish_all(parent):
     """
-    - start a second task just to wait for a disconnect on the parent interface,
     - create a NetworkManager connection for each required container
     - watch the docker socket for network connect/disconnect events
     - if the parent interface goes away, or the container is stopped, remove the NM connections & exit
     """
-    parent = get_default_route()
+    docker = Docker()
+    [await publish_IP(parent, container) for container in (await container_names(docker))]
+    try:
+        await docker_event_loop(docker, parent)
+    except asyncio.exceptions.CancelledError:
+        pass
+    print ('shutting down')
+    [await unpublish_IP(container) for container in (await container_names(docker))]
+    await docker.close()
 
-    if parent is not None:
-        task = asyncio.create_task(watch_for_disconnect(parent))
-        # try:
-        # except asyncio.CancelledError:
-        try:
-            [await publish_IP(parent, container) for container in container_names()]
-            await docker_event_loop(parent)
-        except ShutdownRequested:
-            task.cancel()
-            print ('shutting down')
-            [await unpublish_IP(container) for container in container_names()]
-            await task
-
-async def docker_event_loop(parent):
+async def docker_event_loop(docker: Docker, parent: str) -> None:
     """
     Watch for docker network events and add or remove containers to/from the host DNS as required.
     """
-    for event in docker.events(filters={'type':'network'}, decode=True):
+    subscriber = docker.events.subscribe(filters={'event':['connect','disconnect']})
+    while True:
+        event = await subscriber.get()
         attributes = event['Actor']['Attributes']
         if attributes['type'] == 'bridge':
-            container = docker.containers.get(attributes['container'])
-            if container.labels['dhcp'] == 'true':
+            container = await docker.containers.get(attributes['container'])
+            data = await container.show()
+            container_name = data['Name'].replace('/', '')
+            labels = data['Config']['Labels']
+            if labels.get('dhcp') == 'true':
                 if event['Action'] == 'connect':
-                    await publish_IP(parent, container.name)
+                    await publish_IP(parent, container_name)
                 else:
-                    await unpublish_IP(container.name)
+                    await unpublish_IP(container_name)
 
 async def publish_IP(parent, container):
     """
@@ -159,10 +160,9 @@ async def publish_IP(parent, container):
         settings['macvlan']['parent'] = parent
         settings['ipv4']['dhcp-hostname'] = container
         settings.update()
-        # might need to deactivate before re-activating
         
     # Now, NetworkManager should have a profile, but you still have to activate it
-    new_path = await NM.activate_connection(path)
+    new_path = await nm.activate_connection(path)
     print(f'add ifname {container} dev {parent}: {new_path}')
     return new_path
 
@@ -174,10 +174,25 @@ async def unpublish_IP(container):
         await connection.delete()
         print(f'delete {container}: {path}')
 
+async def main():
+    global group
+
+    parent = get_default_route()
+
+    if parent is not None:
+        group = asyncio.gather(
+            watch_for_disconnect(parent),
+            publish_all(parent),
+        )
+        await group
+
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    asyncio.run(init())
+    try:
+        asyncio.run(main())
+    except asyncio.exceptions.CancelledError:
+        pass
 
     ipr.release()
