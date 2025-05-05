@@ -1,13 +1,13 @@
 #! /usr/bin/python3
  
-import signal
 import asyncio
 
 from aiodocker.docker import Docker
 from aiodocker.exceptions import DockerError
 
-import sdbus
 from pyroute2 import IPRoute
+
+import sdbus
 from sdbus_async.networkmanager import (
     NetworkConnectionSettings,
     NetworkManager,
@@ -22,6 +22,9 @@ from sdbus_async.networkmanager.settings import (
     )
 from sdbus_async.networkmanager.enums import DeviceState, DeviceStateReason
 
+import signal
+from time import sleep
+
 sdbus.set_default_bus(sdbus.sd_bus_open_system())
 ipr = IPRoute()
 nm = NetworkManager()
@@ -31,8 +34,7 @@ def signal_handler(sig, frame):
     Exit cleanly on SIGTERM ("docker stop"), SIGINT (^C when interactive)
     """
     global group
-    if sig in [signal.SIGINT, signal.SIGTERM]:
-        group.cancel()
+    group.cancel()
 
 async def container_names(docker: Docker) -> list:
     """
@@ -55,11 +57,26 @@ def get_default_route() -> str:
     if len(routes) > 0:
         link = ipr.get_links(routes[0].get('OIF'))
         ifname = link[0].get('ifname')
+
+        from os import environ
+        import re
+
+        # get ALLOWED_DEVICES, replacing '*' with '.*' and comma with '|' for regex
+        allowed_devices = '^'+environ.get('ALLOWED_DEVICES','*').replace(',','|^').replace('*','.*')
+        # if the interface doesn't match the allowed devices, return None
+        if not re.match(allowed_devices, ifname):
+            ifname = None
+        disallowed_devices = environ.get('DISALLOWED_DEVICES')
+        # if there are DISALLOWED_DEVICES, and the interface matches any of them, return None
+        if disallowed_devices and re.match('^'+disallowed_devices.replace(',','|^').replace('*','.*'), ifname):
+            ifname = None
+
     return ifname
 
 async def watch_for_disconnect(parent: str) -> None:
     """
     Watch for disconnection on the default route. If it disconnects, exit and let Docker restart the container
+    q.v. https://github.com/aio-libs/aiodocker/blob/main/examples/events.py
     """
     global group
 
@@ -185,6 +202,9 @@ async def main():
             publish_all(parent),
         )
         await group
+    else:
+        # If we have no network, wait 60s before exiting. Docker will restart after that
+        sleep(60)
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)

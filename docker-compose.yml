@@ -4,6 +4,11 @@ services:
     # needed to prevent python's output being buffered (so you can watch the container log)
     tty: true
     container_name: dns-helper
+    environment:
+      # default "*"
+      - ALLOWED_DEVICES="en*,eth*"
+      # default ""
+      - DISALLOWED_DEVICES="wl*"
     restart: unless-stopped
     # needed to let the container issue NetworkManager commands via DBUS
     security_opt:
