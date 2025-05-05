@@ -196,15 +196,15 @@ async def main():
 
     parent = get_default_route()
 
-    if parent is not None:
+    if parent is None:
+        # If we have no network, wait 60s before exiting. Docker will restart after that
+        sleep(60)
+    else:
         group = asyncio.gather(
             watch_for_disconnect(parent),
             publish_all(parent),
         )
         await group
-    else:
-        # If we have no network, wait 60s before exiting. Docker will restart after that
-        sleep(60)
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
