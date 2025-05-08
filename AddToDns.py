@@ -3,38 +3,31 @@
 import asyncio
 
 from aiodocker.docker import Docker
-from aiodocker.exceptions import DockerError
-
-from pyroute2 import IPRoute
 
 import sdbus
 from sdbus_async.networkmanager import (
     NetworkConnectionSettings,
     NetworkManager,
-    NetworkDeviceGeneric,
     NetworkManagerSettings,
     )
-from sdbus_async.networkmanager.settings import (
-    ConnectionProfile,
-    ConnectionSettings,
-    Ipv4Settings, 
-    MacvlanSettings,
-    )
-from sdbus_async.networkmanager.enums import DeviceState, DeviceStateReason
 
 import signal
 from time import sleep
 
 sdbus.set_default_bus(sdbus.sd_bus_open_system())
-ipr = IPRoute()
 nm = NetworkManager()
 
-def signal_handler(sig, frame):
+async def signal_handler(sig, tasks):
     """
     Exit cleanly on SIGTERM ("docker stop"), SIGINT (^C when interactive)
+    (see https://stackoverflow.com/a/79612074/334719)
     """
-    global group
-    group.cancel()
+    print(f"\n> Caught signal: {sig.name}")
+    for task in tasks:
+        task.cancel()
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    print("> Shutdown complete.")
 
 async def container_names(docker: Docker) -> list:
     """
@@ -50,6 +43,9 @@ async def container_names(docker: Docker) -> list:
     return names
 
 def get_default_route() -> str:
+    from pyroute2 import IPRoute
+    ipr = IPRoute()
+
     # ASSUME that get_default_routes actually returns routes in metric order
     # -- I'm not sure that's guaranteed!
     routes = ipr.get_default_routes()
@@ -58,18 +54,26 @@ def get_default_route() -> str:
         link = ipr.get_links(routes[0].get('OIF'))
         ifname = link[0].get('ifname')
 
+        print(f'Default route: {ifname}')
+
         from os import environ
         import re
 
         # get ALLOWED_DEVICES, replacing '*' with '.*' and comma with '|' for regex
         allowed_devices = '^'+environ.get('ALLOWED_DEVICES','*').replace(',','|^').replace('*','.*')
+        print(f'Allowed: {allowed_devices}')
         # if the interface doesn't match the allowed devices, return None
-        if not re.match(allowed_devices, ifname):
+        if re.match(allowed_devices, ifname):
+            # if it's allowed, check that it isn't DISallowed
+            disallowed_devices = environ.get('DISALLOWED_DEVICES')
+            print(f'Disallowed: {disallowed_devices}')
+            # if there are DISALLOWED_DEVICES, and the interface matches any of them, return None
+            if disallowed_devices and re.match('^'+disallowed_devices.replace(',','|^').replace('*','.*'), ifname):
+                ifname = None
+        else:
             ifname = None
-        disallowed_devices = environ.get('DISALLOWED_DEVICES')
-        # if there are DISALLOWED_DEVICES, and the interface matches any of them, return None
-        if disallowed_devices and re.match('^'+disallowed_devices.replace(',','|^').replace('*','.*'), ifname):
-            ifname = None
+
+    ipr.release()
 
     return ifname
 
@@ -78,7 +82,8 @@ async def watch_for_disconnect(parent: str) -> None:
     Watch for disconnection on the default route. If it disconnects, exit and let Docker restart the container
     q.v. https://github.com/aio-libs/aiodocker/blob/main/examples/events.py
     """
-    global group
+    from sdbus_async.networkmanager.enums import DeviceState
+    from sdbus_async.networkmanager import NetworkDeviceGeneric
 
     try:
         device_path = await nm.get_device_by_ip_iface(parent)
@@ -88,29 +93,26 @@ async def watch_for_disconnect(parent: str) -> None:
             old_state,
             reason,
         ) in generic_device.state_changed.catch():
-            print(
-                f"Now {DeviceState(new_state).name}, "
-                f"was {DeviceState(old_state).name}, "
-                f"reason {DeviceStateReason(reason).name}"
-            )
             if DeviceState(new_state) == DeviceState.DISCONNECTED:
-                group.cancel()
-    except asyncio.exceptions.CancelledError:
+                print(f"Now {DeviceState(new_state).name}, was {DeviceState(old_state).name}")
+                # use the signal handler to terminate the other thread (it's fine if it kills this one too!)
+                signal.raise_signal(signal.SIGTERM)
+    except asyncio.CancelledError:
         pass
 
 async def publish_all(parent):
     """
     - create a NetworkManager connection for each required container
     - watch the docker socket for network connect/disconnect events
-    - if the parent interface goes away, or the container is stopped, remove the NM connections & exit
+    - before the container is stopped, remove the NM connections & exit
     """
-    docker = Docker()
-    [await publish_IP(parent, container) for container in (await container_names(docker))]
     try:
+        docker = Docker()
+        [await publish_IP(parent, container) for container in (await container_names(docker))]
         await docker_event_loop(docker, parent)
     except asyncio.exceptions.CancelledError:
         pass
-    print ('shutting down')
+    print ('> shutting down')
     [await unpublish_IP(container) for container in (await container_names(docker))]
     await docker.close()
 
@@ -141,6 +143,12 @@ async def publish_IP(parent, container):
     Functionally equivalent to:
         nmcli connection add ifname {container} con-name {container} save no type macvlan dev {parent} mode vepa -- +ipv4.dhcp-hostname {container}
     """
+    from sdbus_async.networkmanager.settings import (
+        ConnectionProfile,
+        ConnectionSettings,
+        Ipv4Settings, 
+        MacvlanSettings,
+        )
     connection_paths = await NetworkManagerSettings().get_connections_by_id(container)
     path = ''
     if len(connection_paths) == 0:
@@ -191,28 +199,22 @@ async def unpublish_IP(container):
         await connection.delete()
         print(f'delete {container}: {path}')
 
-async def main():
-    global group
+async def main(parent):
+    tasks = [
+        asyncio.create_task(watch_for_disconnect(parent)),
+        asyncio.create_task(publish_all(parent)),
+        ]
+    loop = asyncio.get_running_loop()
+    for s in [signal.SIGTERM, signal.SIGINT]:
+        loop.add_signal_handler(s, lambda s=s: asyncio.create_task(signal_handler(s, tasks)))
+    await asyncio.gather(*tasks)
 
+if __name__ == "__main__":
     parent = get_default_route()
 
     if parent is None:
         # If we have no network, wait 60s before exiting. Docker will restart after that
+        print('Internet not found')
         sleep(60)
     else:
-        group = asyncio.gather(
-            watch_for_disconnect(parent),
-            publish_all(parent),
-        )
-        await group
-
-if __name__ == "__main__":
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    try:
-        asyncio.run(main())
-    except asyncio.exceptions.CancelledError:
-        pass
-
-    ipr.release()
+        asyncio.run(main(parent))
