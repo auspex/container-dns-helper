@@ -131,7 +131,10 @@ async def docker_event_loop(docker: Docker, parent: str) -> None:
             labels = data['Config']['Labels']
             if labels.get('dhcp') == 'true':
                 if event['Action'] == 'connect':
-                    await publish_IP(parent, container_name)
+                    if len(container_name) > 10:
+                        print (f"Can't publish DNS for container names longer than 10 characters: {container_name}")
+                    else:
+                        await publish_IP(parent, container_name)
                 else:
                     await unpublish_IP(container_name)
 
